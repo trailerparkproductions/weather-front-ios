@@ -1,0 +1,9 @@
+[
+  {"id":"KMLB","iem":"MLB","name":"Melbourne, FL","lat":28.1133,"lon":-80.6542,"state":"FL","defaultFor":"Orange City, FL"},
+  {"id":"KTBW","iem":"TBW","name":"Tampa Bay, FL","lat":27.705,"lon":-82.402,"state":"FL"},
+  {"id":"KJAX","iem":"JAX","name":"Jacksonville, FL","lat":30.4847,"lon":-81.7019,"state":"FL"},
+  {"id":"KAMX","iem":"AMX","name":"Miami, FL","lat":25.611,"lon":-80.413,"state":"FL"},
+  {"id":"KTLH","iem":"TLH","name":"Tallahassee, FL","lat":30.398,"lon":-84.329,"state":"FL"},
+  {"id":"KBYX","iem":"BYX","name":"Key West, FL","lat":24.597,"lon":-81.703,"state":"FL"},
+  {"id":"KEVX","iem":"EVX","name":"Eglin AFB, FL","lat":30.565,"lon":-85.922,"state":"FL"}
+]
