@@ -1,10 +1,12 @@
 import SwiftUI
 import MapKit
 import CoreLocation
+import Combine
 
 // Weather Front — personal radar + models app for Rob.
 // Data: RainViewer (US radar tiles), IEM single-site radar tiles (reflectivity + velocity),
-// Open-Meteo (HRRR/GFS/NAM/NBM/ECMWF/ICON models), NWS api.weather.gov (alerts).
+// Open-Meteo (HRRR/GFS/NAM/NBM/ECMWF/ICON/GEM/JMA/Meteo-France models + forecast + place search),
+// NWS api.weather.gov (alerts).
 // No account, no API key, no ads.
 
 let orangeCity = CLLocationCoordinate2D(latitude: 28.93472, longitude: -81.28806)
@@ -15,6 +17,7 @@ struct WeatherFrontApp: App {
     var body: some Scene {
         WindowGroup {
             TabView {
+                ForecastView().tabItem { Label("Forecast", systemImage: "sun.max") }
                 RadarView().tabItem { Label("Radar", systemImage: "cloud.rain") }
                 SitesView().tabItem { Label("Sites", systemImage: "antenna.radiowaves.left.and.right") }
                 ModelsView().tabItem { Label("Models", systemImage: "chart.bar") }
@@ -126,9 +129,43 @@ final class AppState: ObservableObject {
     @Published var sites: [RadarSite] = bundledSites
     @Published var selectedSite: RadarSite = bundledSites[0]
     @Published var alertPolygons: [[CLLocationCoordinate2D]] = []
+    @Published var placeName: String = "Orange City, FL"
+    @Published var placeLat: Double = 28.93472
+    @Published var placeLon: Double = -81.28806
+    @Published var placeToken: Int = 0
     let location = LocationManager()
+    private var pendingGPS: Bool = false
+    private var cancellables: Set<AnyCancellable> = []
+
+    init() {
+        location.$coordinate
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] coord in
+                guard let self = self, let coord = coord, self.pendingGPS else { return }
+                self.pendingGPS = false
+                self.setPlace(name: "Your location", lat: coord.latitude, lon: coord.longitude)
+            }
+            .store(in: &cancellables)
+    }
 
     var userCoordinate: CLLocationCoordinate2D { location.coordinate ?? orangeCity }
+    var forecastCoordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: placeLat, longitude: placeLon) }
+
+    func setPlace(name: String, lat: Double, lon: Double) {
+        placeName = name
+        placeLat = lat
+        placeLon = lon
+        placeToken += 1
+    }
+
+    func useMyLocation() {
+        pendingGPS = true
+        location.request()
+        if let c = location.coordinate {
+            pendingGPS = false
+            setPlace(name: "Your location", lat: c.latitude, lon: c.longitude)
+        }
+    }
 
     func useClosestNexrad() {
         let c = userCoordinate
@@ -261,7 +298,7 @@ final class RadarViewModel: ObservableObject {
     @Published var playing: Bool = false
     @Published var message: String = ""
 
-    func loadRainViewer() async {
+    func loadRainViewer(center: CLLocationCoordinate2D = orangeCity) async {
         guard let url = URL(string: "https://api.rainviewer.com/public/weather-maps.json") else { return }
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
@@ -269,9 +306,43 @@ final class RadarViewModel: ObservableObject {
             rainHost = resp.host
             rainFrames = resp.radar.past
             frameIndex = max(0, rainFrames.count - 1)
+            prefetchRainTiles(center: center)
         } catch {
             message = "Could not load US radar. Check internet."
         }
+    }
+
+    // Warm the tile cache for every animation frame so Play looks smooth.
+    func prefetchRainTiles(center: CLLocationCoordinate2D) {
+        let (x, y) = Self.tileXY(lat: center.latitude, lon: center.longitude, zoom: 6)
+        for frame in rainFrames {
+            let urlStr = "\(rainHost)\(frame.path)/512/6/\(x)/\(y)/2/1_1.png"
+            if let u = URL(string: urlStr) {
+                URLSession.shared.dataTask(with: u) { _, _, _ in }.resume()
+            }
+        }
+    }
+
+    func prefetchSiteTiles(site: RadarSite, product: RadarProduct) {
+        let (x, y) = Self.tileXY(lat: site.lat, lon: site.lon, zoom: 7)
+        for stampRaw in scans {
+            let stamp = stampRaw.replacingOccurrences(of: "-", with: "")
+                .replacingOccurrences(of: "T", with: "")
+                .replacingOccurrences(of: ":", with: "")
+                .replacingOccurrences(of: "Z", with: "")
+            let urlStr = "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::\(site.id)-\(product.id)-\(stamp)/7/\(x)/\(y).png"
+            if let u = URL(string: urlStr) {
+                URLSession.shared.dataTask(with: u) { _, _, _ in }.resume()
+            }
+        }
+    }
+
+    static func tileXY(lat: Double, lon: Double, zoom: Int) -> (Int, Int) {
+        let n = pow(2.0, Double(zoom))
+        let x = Int(floor((lon + 180.0) / 360.0 * n))
+        let latRad = lat * Double.pi / 180.0
+        let y = Int(floor((1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / Double.pi) / 2.0 * n))
+        return (max(0, x), max(0, y))
     }
 
     func loadScans(site: RadarSite, product: RadarProduct) async {
@@ -284,6 +355,7 @@ final class RadarViewModel: ObservableObject {
             let resp = try JSONDecoder().decode(ScanList.self, from: data)
             scans = resp.scans.map { $0.ts }
             frameIndex = max(0, scans.count - 1)
+            prefetchSiteTiles(site: site, product: product)
             if scans.isEmpty {
                 message = "No scans for \(product.name) at \(site.displayID) right now. Try Reflectivity."
             } else {
@@ -343,7 +415,7 @@ struct RadarView: View {
     @State private var product: RadarProduct = RadarProduct(id: "N0B", name: "Reflectivity")
     @State private var centerToken: Int = 0
     @State private var mapCenter: CLLocationCoordinate2D = orangeCity
-    private let timer = Timer.publish(every: 0.9, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 0.6, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationView {
@@ -388,6 +460,12 @@ struct RadarView: View {
                 )
                 .frame(maxHeight: .infinity)
 
+                if frameCount > 1 {
+                    Slider(value: Binding(get: { Double(vm.frameIndex) }, set: { vm.frameIndex = Int($0) }),
+                           in: 0...Double(frameCount - 1), step: 1)
+                        .padding(.horizontal)
+                }
+
                 HStack {
                     Button(vm.playing ? "Pause" : "Play") { vm.playing.toggle() }
                     Text(vm.frameTimeText(siteMode: siteMode)).font(.caption)
@@ -417,6 +495,11 @@ struct RadarView: View {
                 Task { await reload() }
             }
             .onChange(of: siteMode) { _ in Task { await reload() } }
+            .onChange(of: state.placeToken) { _ in
+                mapCenter = state.forecastCoordinate
+                centerToken += 1
+                Task { await reload() }
+            }
             .onChange(of: state.selectedSite) { newSite in
                 let prods = productsFor(newSite)
                 if !prods.contains(product) { product = prods[0] }
@@ -431,6 +514,8 @@ struct RadarView: View {
         }
     }
 
+    var frameCount: Int { siteMode ? vm.scans.count : vm.rainFrames.count }
+
     func closestText() -> String {
         let c = state.userCoordinate
         guard let best = state.sites.filter({ $0.type == "NEXRAD" }).min(by: { $0.milesFrom(c) < $1.milesFrom(c) }) else { return "" }
@@ -441,7 +526,7 @@ struct RadarView: View {
         if siteMode {
             await vm.loadScans(site: state.selectedSite, product: product)
         } else {
-            await vm.loadRainViewer()
+            await vm.loadRainViewer(center: state.forecastCoordinate)
         }
         await state.loadNearbySites()
     }
@@ -501,6 +586,360 @@ struct SitesView: View {
     }
 }
 
+// MARK: - Place search (Open-Meteo geocoding)
+
+struct GeoResponse: Decodable {
+    struct Result: Decodable, Identifiable {
+        let id: Int
+        let name: String
+        let latitude: Double
+        let longitude: Double
+        let admin1: String?
+        let country: String?
+        var label: String {
+            var parts = [name]
+            if let a = admin1, !a.isEmpty { parts.append(a) }
+            if let c = country, !c.isEmpty { parts.append(c) }
+            return parts.joined(separator: ", ")
+        }
+    }
+    let results: [Result]?
+}
+
+struct PlaceSearchView: View {
+    @EnvironmentObject var state: AppState
+    @State private var query: String = ""
+    @State private var results: [GeoResponse.Result] = []
+    @State private var message: String = ""
+    @State private var searching: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Place: \(state.placeName)").font(.subheadline).bold()
+            HStack {
+                TextField("Search city or town", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled(true)
+                Button("Search") { Task { await search() } }
+                    .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty || searching)
+            }
+            Button("Use my location") { state.useMyLocation() }
+            if searching { Text("Searching…").font(.caption).foregroundColor(.secondary) }
+            if !message.isEmpty { Text(message).font(.caption).foregroundColor(.red) }
+            ForEach(results) { r in
+                Button {
+                    state.setPlace(name: r.label, lat: r.latitude, lon: r.longitude)
+                    results = []
+                    query = ""
+                } label: {
+                    HStack {
+                        Image(systemName: "mappin.circle")
+                        Text(r.label).foregroundColor(.primary)
+                        Spacer()
+                    }
+                }
+            }
+        }
+    }
+
+    func search() async {
+        searching = true
+        defer { searching = false }
+        message = ""
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://geocoding-api.open-meteo.com/v1/search?name=\(encoded)&count=8&language=en&format=json") else { return }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let resp = try JSONDecoder().decode(GeoResponse.self, from: data)
+            results = resp.results ?? []
+            if results.isEmpty { message = "No places found. Try a bigger town name." }
+        } catch {
+            message = "Place search failed. Check internet."
+        }
+    }
+}
+
+// MARK: - Open-Meteo shared decoding
+
+struct OMResponse: Decodable {
+    struct Current: Decodable {
+        let time: String?
+        let temperature_2m: Double?
+        let apparent_temperature: Double?
+        let relative_humidity_2m: Double?
+        let pressure_msl: Double?
+        let wind_speed_10m: Double?
+        let wind_gusts_10m: Double?
+        let wind_direction_10m: Double?
+        let precipitation: Double?
+        let weather_code: Int?
+    }
+    struct Hourly: Decodable {
+        let time: [String]
+        let temperature_2m: [Double?]?
+        let apparent_temperature: [Double?]?
+        let precipitation: [Double?]?
+        let precipitation_probability: [Double?]?
+        let wind_speed_10m: [Double?]?
+        let wind_gusts_10m: [Double?]?
+        let wind_direction_10m: [Double?]?
+        let uv_index: [Double?]?
+        let relative_humidity_2m: [Double?]?
+    }
+    struct Daily: Decodable {
+        let time: [String]
+        let temperature_2m_max: [Double?]?
+        let temperature_2m_min: [Double?]?
+        let precipitation_sum: [Double?]?
+        let precipitation_probability_max: [Double?]?
+        let wind_speed_10m_max: [Double?]?
+        let wind_gusts_10m_max: [Double?]?
+        let uv_index_max: [Double?]?
+    }
+    let current: Current?
+    let hourly: Hourly?
+    let daily: Daily?
+}
+
+struct HourRow: Identifiable {
+    var id: String { time }
+    var time: String
+    var temp: Double?
+    var feels: Double?
+    var rain: Double?
+    var chance: Double?
+    var wind: Double?
+    var gust: Double?
+    var windDir: Double?
+    var uv: Double?
+}
+
+struct DayRow: Identifiable {
+    var id: String { date }
+    var date: String
+    var high: Double?
+    var low: Double?
+    var rainTotal: Double?
+    var rainChance: Double?
+    var windMax: Double?
+    var gustMax: Double?
+    var uvMax: Double?
+}
+
+func omValue(_ arr: [Double?]?, _ i: Int) -> Double? {
+    guard let arr = arr, arr.indices.contains(i) else { return nil }
+    return arr[i]
+}
+
+func omHourRows(_ resp: OMResponse, limit: Int) -> [HourRow] {
+    guard let h = resp.hourly else { return [] }
+    let nowFmt = DateFormatter()
+    nowFmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    let nowStr = nowFmt.string(from: Date())
+    var start = 0
+    if let idx = h.time.firstIndex(where: { $0 > nowStr }) { start = max(0, idx - 1) }
+    var out: [HourRow] = []
+    for i in start..<min(h.time.count, start + limit) {
+        out.append(HourRow(
+            time: h.time[i],
+            temp: omValue(h.temperature_2m, i),
+            feels: omValue(h.apparent_temperature, i),
+            rain: omValue(h.precipitation, i),
+            chance: omValue(h.precipitation_probability, i),
+            wind: omValue(h.wind_speed_10m, i),
+            gust: omValue(h.wind_gusts_10m, i),
+            windDir: omValue(h.wind_direction_10m, i),
+            uv: omValue(h.uv_index, i)
+        ))
+    }
+    return out
+}
+
+func omDayRows(_ resp: OMResponse, limit: Int) -> [DayRow] {
+    guard let d = resp.daily else { return [] }
+    var out: [DayRow] = []
+    for i in 0..<min(d.time.count, limit) {
+        out.append(DayRow(
+            date: d.time[i],
+            high: omValue(d.temperature_2m_max, i),
+            low: omValue(d.temperature_2m_min, i),
+            rainTotal: omValue(d.precipitation_sum, i),
+            rainChance: omValue(d.precipitation_probability_max, i),
+            windMax: omValue(d.wind_speed_10m_max, i),
+            gustMax: omValue(d.wind_gusts_10m_max, i),
+            uvMax: omValue(d.uv_index_max, i)
+        ))
+    }
+    return out
+}
+
+func compassText(_ deg: Double?) -> String {
+    guard let deg = deg else { return "" }
+    let dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    let idx = Int((deg.truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360) / 45.0 + 0.5) % 8
+    return dirs[idx]
+}
+
+func weatherCodeText(_ code: Int?) -> String {
+    guard let code = code else { return "" }
+    switch code {
+    case 0: return "Clear sky"
+    case 1, 2, 3: return "Partly cloudy to cloudy"
+    case 45, 48: return "Fog"
+    case 51, 53, 55: return "Drizzle"
+    case 61, 63, 65: return "Rain"
+    case 66, 67: return "Freezing rain"
+    case 71, 73, 75, 77: return "Snow"
+    case 80, 81, 82: return "Rain showers"
+    case 85, 86: return "Snow showers"
+    case 95: return "Thunderstorm"
+    case 96, 99: return "Thunderstorm with hail"
+    default: return "Weather code \(code)"
+    }
+}
+
+func prettyHourTime(_ s: String) -> String {
+    let p = DateFormatter()
+    p.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    let out = DateFormatter()
+    out.dateFormat = "EEE h a"
+    if let d = p.date(from: s) { return out.string(from: d) }
+    return s
+}
+
+func prettyDayDate(_ s: String) -> String {
+    let p = DateFormatter()
+    p.dateFormat = "yyyy-MM-dd"
+    let out = DateFormatter()
+    out.dateFormat = "EEE MMM d"
+    if let d = p.date(from: s) { return out.string(from: d) }
+    return s
+}
+
+// MARK: - Forecast tab
+
+@MainActor
+final class ForecastViewModel: ObservableObject {
+    @Published var current: OMResponse.Current? = nil
+    @Published var uvNow: Double? = nil
+    @Published var hourly: [HourRow] = []
+    @Published var daily: [DayRow] = []
+    @Published var message: String = ""
+    @Published var loading: Bool = false
+
+    func load(at c: CLLocationCoordinate2D) async {
+        loading = true
+        defer { loading = false }
+        let urlStr = "https://api.open-meteo.com/v1/forecast?latitude=\(c.latitude)&longitude=\(c.longitude)&current=temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation,weather_code&hourly=temperature_2m,apparent_temperature,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,wind_direction_10m,uv_index,relative_humidity_2m&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,uv_index_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=16"
+        guard let url = URL(string: urlStr) else { return }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let resp = try JSONDecoder().decode(OMResponse.self, from: data)
+            current = resp.current
+            hourly = omHourRows(resp, limit: 240)
+            daily = omDayRows(resp, limit: 10)
+            uvNow = hourly.first?.uv
+            message = ""
+        } catch {
+            message = "Could not load forecast. Check internet and pull down to try again."
+        }
+    }
+}
+
+struct ForecastView: View {
+    @EnvironmentObject var state: AppState
+    @StateObject private var vm = ForecastViewModel()
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section { PlaceSearchView() }
+                if vm.loading { Section { Text("Loading…") } }
+                if !vm.message.isEmpty {
+                    Section { Text(vm.message).foregroundColor(.red).font(.caption) }
+                }
+                if let cur = vm.current {
+                    Section("Now — \(state.placeName)") {
+                        if let t = cur.temperature_2m {
+                            Text("\(Int(t.rounded()))°F").font(.largeTitle).bold()
+                        }
+                        let sky = weatherCodeText(cur.weather_code)
+                        if !sky.isEmpty { Text(sky) }
+                        if let f = cur.apparent_temperature { Text("Feels like \(Int(f.rounded()))°F") }
+                        if let today = vm.daily.first, let hi = today.high, let lo = today.low {
+                            Text("Today: high \(Int(hi.rounded()))°F, low \(Int(lo.rounded()))°F")
+                        }
+                        if let w = cur.wind_speed_10m {
+                            Text("Wind \(Int(w.rounded())) mph \(compassText(cur.wind_direction_10m))" + (cur.wind_gusts_10m.map { ", gusts \(Int($0.rounded())) mph" } ?? ""))
+                        }
+                        if let uv = vm.uvNow { Text("UV index now: \(String(format: "%.1f", uv))") }
+                        if let today = vm.daily.first, let uvMax = today.uvMax { Text("UV high today: \(String(format: "%.1f", uvMax))") }
+                        if let h = cur.relative_humidity_2m { Text("Humidity \(Int(h.rounded()))%") }
+                        if let p = cur.pressure_msl { Text("Pressure \(String(format: "%.1f", p)) hPa") }
+                    }
+                }
+                if !vm.hourly.isEmpty {
+                    Section("Hour by hour — next 10 days") {
+                        ForEach(vm.hourly) { row in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(prettyHourTime(row.time)).font(.subheadline).bold()
+                                Text(hourLine(row)).font(.caption)
+                            }
+                        }
+                    }
+                }
+                if !vm.daily.isEmpty {
+                    Section("10-day forecast") {
+                        ForEach(vm.daily) { day in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(prettyDayDate(day.date)).font(.subheadline).bold()
+                                Text(dayLine(day)).font(.caption)
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Text("Forecast: Open-Meteo (free, non-commercial). Temp in °F, wind in mph, rain in inches. Free models go to 16 days — see the Models tab.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Forecast")
+            .onAppear {
+                state.location.request()
+                Task { await vm.load(at: state.forecastCoordinate) }
+            }
+            .onChange(of: state.placeToken) { _ in
+                Task { await vm.load(at: state.forecastCoordinate) }
+            }
+            .refreshable { await vm.load(at: state.forecastCoordinate) }
+        }
+    }
+
+    func hourLine(_ r: HourRow) -> String {
+        var parts: [String] = []
+        if let t = r.temp { parts.append("\(Int(t.rounded()))°F") }
+        if let f = r.feels { parts.append("feels \(Int(f.rounded()))°") }
+        if let rain = r.rain { parts.append("rain \(String(format: "%.2f", rain))\"") }
+        if let ch = r.chance { parts.append("\(Int(ch.rounded()))% chance") }
+        if let w = r.wind { parts.append("wind \(Int(w.rounded())) mph \(compassText(r.windDir))") }
+        if let g = r.gust { parts.append("gusts \(Int(g.rounded()))") }
+        if let uv = r.uv { parts.append("UV \(String(format: "%.1f", uv))") }
+        return parts.isEmpty ? "No data" : parts.joined(separator: "  •  ")
+    }
+
+    func dayLine(_ d: DayRow) -> String {
+        var parts: [String] = []
+        if let hi = d.high, let lo = d.low { parts.append("High \(Int(hi.rounded()))°F / Low \(Int(lo.rounded()))°F") }
+        if let rain = d.rainTotal { parts.append("rain \(String(format: "%.2f", rain))\"") }
+        if let ch = d.rainChance { parts.append("\(Int(ch.rounded()))% chance") }
+        if let w = d.windMax { parts.append("wind up to \(Int(w.rounded())) mph") }
+        if let g = d.gustMax { parts.append("gusts \(Int(g.rounded()))") }
+        if let uv = d.uvMax { parts.append("UV high \(String(format: "%.1f", uv))") }
+        return parts.isEmpty ? "No data" : parts.joined(separator: "  •  ")
+    }
+}
+
 // MARK: - Models (Open-Meteo)
 
 struct WeatherModel: Identifiable, Hashable {
@@ -519,47 +958,32 @@ let weatherModels: [WeatherModel] = [
     WeatherModel(name: "ECMWF", apiID: "ecmwf_ifs025", blurb: "European model, often very good"),
     WeatherModel(name: "ICON", apiID: "icon_seamless", blurb: "German DWD model"),
     WeatherModel(name: "GEM", apiID: "gem_seamless", blurb: "Canadian model"),
+    WeatherModel(name: "JMA", apiID: "jma_seamless", blurb: "Japanese model"),
+    WeatherModel(name: "Météo-France", apiID: "meteofrance_seamless", blurb: "French model"),
 ]
-
-struct OMResponse: Decodable {
-    struct Hourly: Decodable {
-        let time: [String]
-        let temperature_2m: [Double?]?
-        let precipitation: [Double?]?
-        let precipitation_probability: [Double?]?
-        let wind_speed_10m: [Double?]?
-        let wind_gusts_10m: [Double?]?
-    }
-    let hourly: Hourly
-}
-
-struct HourRow: Identifiable {
-    var id: String { time }
-    var time: String
-    var temp: Double?
-    var rain: Double?
-    var chance: Double?
-    var wind: Double?
-    var gust: Double?
-}
 
 struct ModelSummary: Identifiable {
     var id: String { modelName }
     var modelName: String
     var rain24: Double?
     var rain48: Double?
+    var rain7d: Double?
     var note: String
 }
 
 @MainActor
 final class ModelsViewModel: ObservableObject {
-    @Published var rows: [HourRow] = []
+    @Published var rowsByModel: [String: [HourRow]] = [:]
+    @Published var daysByModel: [String: [DayRow]] = [:]
+    @Published var averageRows: [HourRow] = []
+    @Published var averageDays: [DayRow] = []
     @Published var summaries: [ModelSummary] = []
     @Published var message: String = ""
     @Published var loading: Bool = false
+    @Published var loaded: Bool = false
 
     func fetch(model: WeatherModel, at c: CLLocationCoordinate2D) async -> OMResponse? {
-        var urlStr = "https://api.open-meteo.com/v1/forecast?latitude=\(c.latitude)&longitude=\(c.longitude)&hourly=temperature_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=7"
+        var urlStr = "https://api.open-meteo.com/v1/forecast?latitude=\(c.latitude)&longitude=\(c.longitude)&hourly=temperature_2m,precipitation,precipitation_probability,wind_speed_10m,wind_gusts_10m,uv_index&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,uv_index_max&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=16"
         if let apiID = model.apiID { urlStr += "&models=\(apiID)" }
         guard let url = URL(string: urlStr) else { return nil }
         do {
@@ -570,89 +994,150 @@ final class ModelsViewModel: ObservableObject {
         }
     }
 
-    func load(model: WeatherModel, at c: CLLocationCoordinate2D) async {
+    func loadAll(at c: CLLocationCoordinate2D) async {
         loading = true
         defer { loading = false }
-        guard let resp = await fetch(model: model, at: c) else {
-            rows = []
-            message = "\(model.name) gave no data here. Try Best Match or HRRR."
-            return
-        }
-        message = ""
-        rows = Self.makeRows(resp)
-    }
-
-    func compareAll(at c: CLLocationCoordinate2D) async {
-        loading = true
-        defer { loading = false }
-        var out: [ModelSummary] = []
+        var newRows: [String: [HourRow]] = [:]
+        var newDays: [String: [DayRow]] = [:]
+        var newSummaries: [ModelSummary] = []
         for m in weatherModels {
             if let resp = await fetch(model: m, at: c) {
-                let r = Self.makeRows(resp)
-                let rain24 = r.prefix(24).compactMap { $0.rain }.reduce(0, +)
-                let rain48 = r.prefix(48).compactMap { $0.rain }.reduce(0, +)
-                out.append(ModelSummary(modelName: m.name, rain24: rain24, rain48: rain48, note: ""))
+                let rows = omHourRows(resp, limit: 384)
+                let hasData = rows.contains { $0.temp != nil }
+                newRows[m.name] = rows
+                newDays[m.name] = omDayRows(resp, limit: 16)
+                if hasData {
+                    newSummaries.append(ModelSummary(
+                        modelName: m.name,
+                        rain24: rows.prefix(24).compactMap { $0.rain }.reduce(0, +),
+                        rain48: rows.prefix(48).compactMap { $0.rain }.reduce(0, +),
+                        rain7d: rows.prefix(168).compactMap { $0.rain }.reduce(0, +),
+                        note: ""))
+                } else {
+                    newSummaries.append(ModelSummary(modelName: m.name, rain24: nil, rain48: nil, rain7d: nil, note: "No data"))
+                }
             } else {
-                out.append(ModelSummary(modelName: m.name, rain24: nil, rain48: nil, note: "No data"))
+                newRows[m.name] = []
+                newDays[m.name] = []
+                newSummaries.append(ModelSummary(modelName: m.name, rain24: nil, rain48: nil, rain7d: nil, note: "No data"))
             }
         }
-        summaries = out
-    }
-
-    static func makeRows(_ resp: OMResponse) -> [HourRow] {
-        let h = resp.hourly
-        let nowFmt = DateFormatter()
-        nowFmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
-        let nowStr = nowFmt.string(from: Date())
-        var start = 0
-        if let idx = h.time.firstIndex(where: { $0 > nowStr }) { start = max(0, idx - 1) }
-        var out: [HourRow] = []
-        for i in start..<min(h.time.count, start + 48) {
-            out.append(HourRow(
-                time: h.time[i],
-                temp: value(h.temperature_2m, i),
-                rain: value(h.precipitation, i),
-                chance: value(h.precipitation_probability, i),
-                wind: value(h.wind_speed_10m, i),
-                gust: value(h.wind_gusts_10m, i)
-            ))
+        rowsByModel = newRows
+        daysByModel = newDays
+        summaries = newSummaries
+        averageRows = Self.averageHours(Array(newRows.values))
+        averageDays = Self.averageDays(Array(newDays.values))
+        if !averageRows.isEmpty {
+            let avg = averageRows
+            summaries.append(ModelSummary(
+                modelName: "Average of models",
+                rain24: avg.prefix(24).compactMap { $0.rain }.reduce(0, +),
+                rain48: avg.prefix(48).compactMap { $0.rain }.reduce(0, +),
+                rain7d: avg.prefix(168).compactMap { $0.rain }.reduce(0, +),
+                note: ""))
         }
-        return out
+        loaded = true
+        message = averageRows.isEmpty ? "No model data here right now. Check internet and pull down to try again." : ""
     }
 
-    static func value(_ arr: [Double?]?, _ i: Int) -> Double? {
-        guard let arr = arr, arr.indices.contains(i) else { return nil }
-        return arr[i]
+    static func avg(_ values: [Double?]) -> Double? {
+        let v = values.compactMap { $0 }
+        guard !v.isEmpty else { return nil }
+        return v.reduce(0, +) / Double(v.count)
     }
+
+    static func averageHours(_ allRows: [[HourRow]]) -> [HourRow] {
+        var byTime: [String: [HourRow]] = [:]
+        for rows in allRows {
+            for r in rows { byTime[r.time, default: []].append(r) }
+        }
+        return byTime.keys.sorted().map { t in
+            let rs = byTime[t] ?? []
+            return HourRow(
+                time: t,
+                temp: avg(rs.map { $0.temp }),
+                feels: avg(rs.map { $0.feels }),
+                rain: avg(rs.map { $0.rain }),
+                chance: avg(rs.map { $0.chance }),
+                wind: avg(rs.map { $0.wind }),
+                gust: avg(rs.map { $0.gust }),
+                windDir: nil,
+                uv: avg(rs.map { $0.uv }))
+        }
+    }
+
+    static func averageDays(_ allDays: [[DayRow]]) -> [DayRow] {
+        var byDate: [String: [DayRow]] = [:]
+        for days in allDays {
+            for d in days { byDate[d.date, default: []].append(d) }
+        }
+        return byDate.keys.sorted().map { date in
+            let ds = byDate[date] ?? []
+            return DayRow(
+                date: date,
+                high: avg(ds.map { $0.high }),
+                low: avg(ds.map { $0.low }),
+                rainTotal: avg(ds.map { $0.rainTotal }),
+                rainChance: avg(ds.map { $0.rainChance }),
+                windMax: avg(ds.map { $0.windMax }),
+                gustMax: avg(ds.map { $0.gustMax }),
+                uvMax: avg(ds.map { $0.uvMax }))
+        }
+    }
+}
+
+struct PlacePin: Identifiable {
+    var id: String { name }
+    var name: String
+    var coordinate: CLLocationCoordinate2D
 }
 
 struct ModelsView: View {
     @EnvironmentObject var state: AppState
     @StateObject private var vm = ModelsViewModel()
     @State private var model: WeatherModel = weatherModels[1]  // HRRR
+    @State private var showAverage: Bool = false
+    @State private var mapHour: Double = 0
+    @State private var mapRegion: MKCoordinateRegion = MKCoordinateRegion(center: orangeCity, span: MKCoordinateSpan(latitudeDelta: 3, longitudeDelta: 3))
+
+    var selectedRows: [HourRow] {
+        showAverage ? vm.averageRows : (vm.rowsByModel[model.name] ?? [])
+    }
+    var selectedDays: [DayRow] {
+        showAverage ? vm.averageDays : (vm.daysByModel[model.name] ?? [])
+    }
+    var selectedName: String { showAverage ? "Average of models" : model.name }
 
     var body: some View {
         NavigationView {
             List {
+                Section { PlaceSearchView() }
                 Section {
                     Picker("Model", selection: $model) {
                         ForEach(weatherModels) { m in Text(m.name).tag(m) }
                     }
-                    Text(model.blurb).font(.caption).foregroundColor(.secondary)
-                    Text("Place: \(state.location.coordinate == nil ? "Orange City, FL" : "your location")")
+                    .onChange(of: model) { _ in showAverage = false }
+                    Toggle("Show average of models instead", isOn: $showAverage)
+                    Text(showAverage ? "Simple average of every model that has data for that hour. Models with no data are left out." : model.blurb)
                         .font(.caption).foregroundColor(.secondary)
-                    Button("Compare all models (rain totals)") {
-                        Task { await vm.compareAll(at: state.userCoordinate) }
+                    Text("Models go to 16 days. 4 weeks is not available free.")
+                        .font(.caption).bold()
+                    Button("Load all models") {
+                        Task { await vm.loadAll(at: state.forecastCoordinate) }
                     }
+                }
+                if vm.loading { Section { Text("Loading models…") } }
+                if !vm.message.isEmpty {
+                    Section { Text(vm.message).foregroundColor(.red).font(.caption) }
                 }
                 if !vm.summaries.isEmpty {
                     Section("Rain totals by model") {
                         ForEach(vm.summaries) { s in
                             HStack {
-                                Text(s.modelName)
+                                Text(s.modelName).fontWeight(s.modelName == "Average of models" ? .bold : .regular)
                                 Spacer()
-                                if let r24 = s.rain24, let r48 = s.rain48 {
-                                    Text("24h \(String(format: "%.2f", r24))\"  48h \(String(format: "%.2f", r48))\"")
+                                if let r24 = s.rain24, let r48 = s.rain48, let r7 = s.rain7d {
+                                    Text("24h \(String(format: "%.2f", r24))\"  48h \(String(format: "%.2f", r48))\"  7d \(String(format: "%.2f", r7))\"")
                                         .font(.caption)
                                 } else {
                                     Text(s.note).font(.caption).foregroundColor(.secondary)
@@ -663,22 +1148,48 @@ struct ModelsView: View {
                             .font(.caption).foregroundColor(.secondary)
                     }
                 }
-                if vm.loading { Section { Text("Loading…") } }
-                if !vm.message.isEmpty {
-                    Section { Text(vm.message).foregroundColor(.red).font(.caption) }
-                }
-                Section("Next 48 hours — \(model.name)") {
-                    ForEach(vm.rows) { row in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(prettyTime(row.time)).font(.subheadline).bold()
-                            Text(lineFor(row)).font(.caption)
-                            if let rain = row.rain, rain > 0 {
-                                GeometryReader { geo in
-                                    Rectangle()
-                                        .fill(Color.blue)
-                                        .frame(width: max(4, min(geo.size.width, CGFloat(rain) * 300)), height: 6)
+                if vm.loaded {
+                    Section("Model map — \(selectedName)") {
+                        Map(coordinateRegion: $mapRegion, annotationItems: [PlacePin(name: state.placeName, coordinate: state.forecastCoordinate)]) { pin in
+                            MapAnnotation(coordinate: pin.coordinate) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "mappin.circle.fill").foregroundColor(.red)
+                                    Text(pin.name).font(.caption2).bold()
                                 }
-                                .frame(height: 6)
+                            }
+                        }
+                        .frame(height: 220)
+                        if selectedRows.count > 1 {
+                            Slider(value: $mapHour, in: 0...Double(min(selectedRows.count, 168) - 1), step: 1)
+                            let row = selectedRows[min(Int(mapHour), selectedRows.count - 1)]
+                            Text("\(prettyHourTime(row.time)) — \(lineFor(row))").font(.caption)
+                        } else {
+                            Text("No hourly data for this model here.").font(.caption).foregroundColor(.secondary)
+                        }
+                        Text("Simple model map: it shows the model numbers at your place. It is not a full colour weather map — that needs a map server.")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    Section("Next 72 hours — \(selectedName)") {
+                        ForEach(Array(selectedRows.prefix(72))) { row in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(prettyHourTime(row.time)).font(.subheadline).bold()
+                                Text(lineFor(row)).font(.caption)
+                                if let rain = row.rain, rain > 0 {
+                                    GeometryReader { geo in
+                                        Rectangle()
+                                            .fill(Color.blue)
+                                            .frame(width: max(4, min(geo.size.width, CGFloat(rain) * 300)), height: 6)
+                                    }
+                                    .frame(height: 6)
+                                }
+                            }
+                        }
+                    }
+                    Section("Day by day to 16 days — \(selectedName)") {
+                        ForEach(selectedDays) { day in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(prettyDayDate(day.date)).font(.subheadline).bold()
+                                Text(dayLine(day)).font(.caption)
                             }
                         }
                     }
@@ -691,22 +1202,16 @@ struct ModelsView: View {
             .navigationTitle("Models")
             .onAppear {
                 state.location.request()
-                Task { await vm.load(model: model, at: state.userCoordinate) }
+                mapRegion = MKCoordinateRegion(center: state.forecastCoordinate, span: MKCoordinateSpan(latitudeDelta: 3, longitudeDelta: 3))
+                Task { await vm.loadAll(at: state.forecastCoordinate) }
             }
-            .onChange(of: model) { m in
-                Task { await vm.load(model: m, at: state.userCoordinate) }
+            .onChange(of: state.placeToken) { _ in
+                mapHour = 0
+                mapRegion = MKCoordinateRegion(center: state.forecastCoordinate, span: MKCoordinateSpan(latitudeDelta: 3, longitudeDelta: 3))
+                Task { await vm.loadAll(at: state.forecastCoordinate) }
             }
-            .refreshable { await vm.load(model: model, at: state.userCoordinate) }
+            .refreshable { await vm.loadAll(at: state.forecastCoordinate) }
         }
-    }
-
-    func prettyTime(_ s: String) -> String {
-        let p = DateFormatter()
-        p.dateFormat = "yyyy-MM-dd'T'HH:mm"
-        let out = DateFormatter()
-        out.dateFormat = "EEE h a"
-        if let d = p.date(from: s) { return out.string(from: d) }
-        return s
     }
 
     func lineFor(_ r: HourRow) -> String {
@@ -716,6 +1221,18 @@ struct ModelsView: View {
         if let ch = r.chance { parts.append("\(Int(ch.rounded()))% chance") }
         if let w = r.wind { parts.append("wind \(Int(w.rounded())) mph") }
         if let g = r.gust { parts.append("gusts \(Int(g.rounded()))") }
+        if let uv = r.uv { parts.append("UV \(String(format: "%.1f", uv))") }
+        return parts.isEmpty ? "No data" : parts.joined(separator: "  •  ")
+    }
+
+    func dayLine(_ d: DayRow) -> String {
+        var parts: [String] = []
+        if let hi = d.high, let lo = d.low { parts.append("High \(Int(hi.rounded()))°F / Low \(Int(lo.rounded()))°F") }
+        if let rain = d.rainTotal { parts.append("rain \(String(format: "%.2f", rain))\"") }
+        if let ch = d.rainChance { parts.append("\(Int(ch.rounded()))% chance") }
+        if let w = d.windMax { parts.append("wind up to \(Int(w.rounded())) mph") }
+        if let g = d.gustMax { parts.append("gusts \(Int(g.rounded()))") }
+        if let uv = d.uvMax { parts.append("UV high \(String(format: "%.1f", uv))") }
         return parts.isEmpty ? "No data" : parts.joined(separator: "  •  ")
     }
 }
@@ -823,11 +1340,14 @@ struct AlertsView: View {
                 }
             }
             .navigationTitle("Alerts")
+            .onChange(of: state.placeToken) { _ in
+                Task { await vm.load(at: state.forecastCoordinate, state: state) }
+            }
             .onAppear {
                 state.location.request()
-                Task { await vm.load(at: state.userCoordinate, state: state) }
+                Task { await vm.load(at: state.forecastCoordinate, state: state) }
             }
-            .refreshable { await vm.load(at: state.userCoordinate, state: state) }
+            .refreshable { await vm.load(at: state.forecastCoordinate, state: state) }
         }
     }
 
